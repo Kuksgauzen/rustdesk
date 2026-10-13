@@ -49,6 +49,7 @@
     "--filesystem=home",
     "--device=dri",
     "--socket=pulseaudio",
-    "--talk-name=org.freedesktop.Flatpak"
+    "--talk-name=org.freedesktop.Flatpak",
+    "--own-name=org.rustdesk.rustdesk"
   ]
 }
