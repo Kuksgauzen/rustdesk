@@ -85,9 +85,36 @@ class MainFlutterWindow: NSWindow {
             WakelockPlusMacosPlugin.register(with: controller.registrar(forPlugin: "WakelockPlusMacosPlugin"))
             WindowSizePlugin.register(with: controller.registrar(forPlugin: "WindowSizePlugin"))
             TextureRgbaRendererPlugin.register(with: controller.registrar(forPlugin: "TextureRgbaRendererPlugin"))
+            MainFlutterWindow.syncLifecycleWhenShown(controller)
         }
 
         super.awakeFromNib()
+    }
+
+    /// A new Flutter engine assumes the app is hidden until the app's occlusion state changes.
+    /// When a window opens while the main window is shown, that state does not change, the next
+    /// activation reports "hidden" to the new engine and its window stops drawing after the first
+    /// frame. Pass the engine the app state once its window is on screen.
+    /// https://github.com/flutter/flutter/issues/155977
+    static func syncLifecycleWhenShown(_ controller: FlutterViewController) {
+        guard let window = controller.view.window else { return }
+        var observer: NSObjectProtocol?
+        observer = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+        ) { [weak window, weak controller] _ in
+            guard let window = window, window.occlusionState.contains(.visible) else { return }
+            if let observer = observer {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            observer = nil
+            guard let engine: FlutterAppLifecycleDelegate = controller?.engine else { return }
+            engine.handleDidChangeOcclusionState?(
+                Notification(name: NSApplication.didChangeOcclusionStateNotification, object: NSApp))
+            if NSApp.isActive {
+                engine.handleWillBecomeActive?(
+                    Notification(name: NSApplication.willBecomeActiveNotification, object: NSApp))
+            }
+        }
     }
 
     override public func order(_ place: NSWindow.OrderingMode, relativeTo otherWin: Int) {
