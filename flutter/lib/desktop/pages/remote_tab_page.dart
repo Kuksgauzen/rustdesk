@@ -67,6 +67,9 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
       ConnectionTypeState.init(peerId!);
       tabController.onSelected = (id) {
         final remotePage = tabController.widget(id);
+        // A tab that was never shown has no page state yet. Its page calls
+        // this again after its first frame.
+        if (remotePage is RemotePage && !remotePage.isBuilt) return;
         if (remotePage is RemotePage) {
           final ffi = remotePage.ffi;
           bind.setCurSessionId(sessionId: ffi.sessionId);
