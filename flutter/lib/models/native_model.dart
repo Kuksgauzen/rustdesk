@@ -160,16 +160,6 @@ class PlatformFFI {
         debugPrint('Failed to get documents directory: $e');
       }
       _ffiBind = RustdeskImpl(dylib);
-
-      if (isLinux) {
-        if (isMain) {
-          // Start a dbus service for uri links, no need to await
-          _ffiBind.mainStartDbusServer();
-        }
-      } else if (isMacOS && isMain) {
-        // Start ipc service for uri links.
-        _ffiBind.mainStartIpcUrlServer();
-      }
       _startListenEvent(_ffiBind); // global event
       try {
         if (isAndroid) {
