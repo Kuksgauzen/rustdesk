@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:desktop_multi_window/desktop_multi_window.dart';
@@ -49,6 +50,77 @@ class MultiWindowCallResult {
   MultiWindowCallResult(this.windowId, this.result);
 }
 
+/// Calls a sub window, retrying while it is still starting. A window that was just created
+/// answers with MissingPluginException until its Dart code sets the method handler, and a
+/// session sent to it then would be lost, e.g. the second link of a burst.
+@visibleForTesting
+Future<T> callWhileWindowStarts<T>(Future<T> Function() call,
+    {int attempts = 50,
+    Duration interval = const Duration(milliseconds: 100)}) async {
+  for (var i = 1;; i++) {
+    try {
+      return await call();
+    } on MissingPluginException {
+      if (i >= attempts) rethrow;
+      await Future.delayed(interval);
+    }
+  }
+}
+
+/// Waits until a just created window serves calls. Before its engine runs, a call to the
+/// window is never answered; after that it fails with MissingPluginException until its Dart
+/// code sets the method handler. [probe] must be a call that changes nothing.
+@visibleForTesting
+Future<void> waitWindowReady(Future<dynamic> Function() probe,
+    {int attempts = 50,
+    Duration interval = const Duration(milliseconds: 100)}) async {
+  for (var i = 1; i <= attempts; i++) {
+    try {
+      await probe().timeout(interval);
+      return;
+    } on TimeoutException {
+      // Not running yet, the probe is lost.
+    } on MissingPluginException {
+      await Future.delayed(interval);
+    } catch (_) {
+      // Its method handler answered.
+      return;
+    }
+  }
+}
+
+/// Opens a session in the tab window of [key]: creates the window when there is none, or
+/// sends the session to it. Sessions that come while the window is created and starts wait
+/// for it in [creating] instead of creating more windows or calling a window that does not
+/// serve calls yet.
+@visibleForTesting
+Future<MultiWindowCallResult> openInTabWindow(
+    Map<Object, Future<int>> creating,
+    Object key,
+    List<int> windows,
+    Future<int> Function() createWindow,
+    Future<MultiWindowCallResult> Function() callWindow) async {
+  for (var c = creating[key]; c != null; c = creating[key]) {
+    try {
+      await c;
+    } catch (_) {
+      // The session that creates the window reports the error.
+    }
+  }
+  if (windows.isNotEmpty) {
+    return callWindow();
+  }
+  final window = createWindow();
+  creating[key] = window;
+  try {
+    return MultiWindowCallResult(await window, null);
+  } finally {
+    if (creating[key] == window) {
+      creating.remove(key);
+    }
+  }
+}
+
 /// Window Manager
 /// mainly use it in `Main Window`
 /// use it in sub window is not recommended
@@ -65,6 +137,8 @@ class RustDeskMultiWindowManager {
   final List<int> _viewCameraWindows = List.empty(growable: true);
   final List<int> _portForwardWindows = List.empty(growable: true);
   final List<int> _terminalWindows = List.empty(growable: true);
+  // The tab window being created for each window type, see [openInTabWindow].
+  final Map<Object, Future<int>> _creatingTabWindows = {};
 
   moveTabToNewWindow(int windowId, String peerId, String sessionId,
       WindowType windowType) async {
@@ -189,13 +263,13 @@ class RustDeskMultiWindowManager {
     Rect? screenRect,
   }) async {
     if (openInTabs) {
-      if (windows.isEmpty) {
+      return openInTabWindow(_creatingTabWindows, type, windows, () async {
         final windowId = await newSessionWindow(
             type, remoteId, msg, windows, screenRect != null);
-        return MultiWindowCallResult(windowId, null);
-      } else {
-        return call(type, methodName, msg);
-      }
+        await waitWindowReady(() => DesktopMultiWindow.invokeMethod(
+            windowId, kWindowEventGetRemoteList));
+        return windowId;
+      }, () => callWhileWindowStarts(() => call(type, methodName, msg)));
     } else {
       if (_inactiveWindows.isNotEmpty) {
         for (final windowId in windows) {
@@ -257,8 +331,9 @@ class RustDeskMultiWindowManager {
 
     if (windows.length > 1 || !openInTabs) {
       for (final windowId in windows) {
-        if (await DesktopMultiWindow.invokeMethod(
-            windowId, kWindowEventActiveSession, remoteId)) {
+        if (await callWhileWindowStarts<dynamic>(() =>
+            DesktopMultiWindow.invokeMethod(
+                windowId, kWindowEventActiveSession, remoteId))) {
           return MultiWindowCallResult(windowId, null);
         }
       }
