@@ -20,6 +20,51 @@ const std::vector<std::string> parameters_white_list = {"--install", "--cm"};
 
 const wchar_t* getWindowClassName();
 
+// A launch without arguments waits for the main window of an earlier launch
+// for at most kMainWindowPollAttempts * kMainWindowPollIntervalMs = 10 s.
+static const DWORD kMainWindowPollIntervalMs = 100;
+static const int kMainWindowPollAttempts = 100;
+
+// FindWindowW and CreateAndShow below are not atomic, so launches that overlap
+// in time could all miss the main window and each open their own. Serialize
+// them with a per-session mutex, as the tray does. The first launch takes it
+// and holds it until the process exits; later ones wait here for its window.
+// If the owner exits first, the waiting launch takes the mutex and starts.
+// If neither happens in time, the launch goes on as before.
+// Only called for launches without arguments, which would show the main
+// window. Launches with arguments (`--connect`, `rustdesk://` links, ...)
+// never wait and take the old path.
+static void WaitForMainWindowOwner(const std::wstring& app_name) {
+  std::wstring mutex_name = L"Local\\" + app_name + L"_main";
+  ::SetLastError(0);
+  HANDLE mutex = ::CreateMutexW(NULL, TRUE, mutex_name.c_str());
+  DWORD error = ::GetLastError();
+  if (mutex != NULL && error == ERROR_ALREADY_EXISTS) {
+    for (int i = 0; i < kMainWindowPollAttempts; i++) {
+      if (::FindWindowW(getWindowClassName(), app_name.c_str()) != NULL) {
+        return;
+      }
+      DWORD wait = ::WaitForSingleObject(mutex, kMainWindowPollIntervalMs);
+      if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
+        return;
+      }
+    }
+  } else if (mutex == NULL && error == ERROR_ACCESS_DENIED) {
+    // The mutex was created by a process with a higher integrity level or by
+    // another user in the same session. It cannot be opened, so only wait for
+    // the window.
+    for (int i = 0; i < kMainWindowPollAttempts; i++) {
+      if (::FindWindowW(getWindowClassName(), app_name.c_str()) != NULL) {
+        return;
+      }
+      ::Sleep(kMainWindowPollIntervalMs);
+    }
+  }
+  // Any other CreateMutexW failure (mutex == NULL): do not wait, go on as
+  // before this change. When it succeeded, the handle stays open, and the
+  // mutex owned, until the process exits.
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command)
 {
@@ -87,6 +132,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     if (get_rustdesk_app_name(app_name_buffer, 512) == 0) {
       app_name = std::wstring(app_name_buffer);
     }
+  }
+
+  // Only a launch that would show the main window waits. `--install`, `--cm`
+  // and every other launch with arguments take the old path.
+  if (command_line_arguments.empty()) {
+    WaitForMainWindowOwner(app_name);
   }
 
   // Uri links dispatch
