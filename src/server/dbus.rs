@@ -18,6 +18,11 @@ const DBUS_METHOD_RETURN: &str = "ret";
 const DBUS_METHOD_RETURN_SUCCESS: &str = "ok";
 const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Unique bus name of the connection `start_dbus_server` serves on, `Err` if it could not request
+// the name.
+static SERVER_CONNECTION: std::sync::Mutex<Option<Result<String, ()>>> =
+    std::sync::Mutex::new(None);
+
 #[derive(Debug)]
 struct DbusError(String);
 
@@ -54,13 +59,44 @@ pub fn invoke_new_connection(uni_links: String) -> Result<(), Box<dyn Error>> {
 /// The function will block current thread to serve dbus server.
 /// So it's suitable to spawn a new thread dedicated to dbus server.
 pub fn start_dbus_server() -> Result<(), Box<dyn Error>> {
-    let conn: Connection = Connection::new_session()?;
-    let _ = conn.request_name(DBUS_NAME, false, true, false)?;
+    let conn = Connection::new_session().and_then(|conn| {
+        conn.request_name(DBUS_NAME, false, true, false)
+            .map(|_| conn)
+    });
+    *SERVER_CONNECTION.lock().unwrap_or_else(|e| e.into_inner()) = Some(
+        conn.as_ref()
+            .map(|conn| conn.unique_name().to_string())
+            .map_err(|_| ()),
+    );
+    let conn: Connection = conn?;
     let mut cr = Crossroads::new();
     let token = cr.register(DBUS_NAME, handle_client_message);
     cr.insert(DBUS_PREFIX, &[token], ());
     cr.serve(&conn)?;
     Ok(())
+}
+
+/// Whether the server this process started owns `org.rustdesk.rustdesk` or failed to request it,
+/// e.g. in a sandbox that does not let it own the name. Until then it may be queued behind another
+/// process that still owns the name.
+pub fn dbus_server_settled(conn: &Connection) -> bool {
+    let ours = match SERVER_CONNECTION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        None => return false,
+        Some(Err(())) => return true,
+        Some(Ok(ours)) => ours,
+    };
+    let proxy = conn.with_proxy(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        Duration::from_secs(1),
+    );
+    let owner: Result<(String,), _> =
+        proxy.method_call("org.freedesktop.DBus", "GetNameOwner", (DBUS_NAME,));
+    matches!(owner, Ok((owner,)) if owner == ours)
 }
 
 fn handle_client_message(builder: &mut IfaceBuilder<()>) {
@@ -70,6 +106,15 @@ fn handle_client_message(builder: &mut IfaceBuilder<()>) {
         (DBUS_METHOD_NEW_CONNECTION_ID,),
         (DBUS_METHOD_RETURN,),
         move |_, _, (_uni_links,): (String,)| {
+            // Custom clients own the same name: refuse the empty link their launcher sends, so it
+            // opens its own main window instead of showing this one.
+            if !_uni_links.starts_with(&crate::get_uri_prefix())
+                && _uni_links
+                    .split_once("://")
+                    .map_or(false, |(_, path)| path.chars().all(|c| c == '/'))
+            {
+                return Ok(("not ours".to_string(),));
+            }
             #[cfg(feature = "flutter")]
             {
                 use crate::flutter;
@@ -83,9 +128,12 @@ fn handle_client_message(builder: &mut IfaceBuilder<()>) {
                     Some(false) => {
                         log::error!("failed to add dbus message to flutter global dbus stream.")
                     }
-                    Some(true) => {}
+                    Some(true) => return Ok((DBUS_METHOD_RETURN_SUCCESS.to_string(),)),
                 }
+                // Not delivered: let the sender handle its url as if nobody answered.
+                return Ok(("not delivered".to_string(),));
             }
+            #[cfg(not(feature = "flutter"))]
             return Ok((DBUS_METHOD_RETURN_SUCCESS.to_string(),));
         },
     );

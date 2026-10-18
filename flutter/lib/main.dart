@@ -141,9 +141,7 @@ void runMainApp(bool startService) async {
   }
   // Serve uri links from other launches only now: startService has set the event callback, and
   // a url event that arrives before it is dropped. No need to await.
-  if (isLinux) {
-    bind.mainStartDbusServer();
-  } else if (isMacOS) {
+  if (isMacOS) {
     bind.mainStartIpcUrlServer();
   }
   await Future.wait([gFFI.abModel.loadCache(), gFFI.groupModel.loadCache()]);
@@ -172,6 +170,11 @@ void runMainApp(bool startService) async {
       windowManager.focus();
       // Move registration of active main window here to prevent from async visible check.
       rustDeskWinManager.registerActiveWindow(kWindowMainId);
+    }
+    // Launches wait for the DBus name (platform/linux.rs), so a launcher click during startup is
+    // served only now and its show is not undone by the hide above. No need to await.
+    if (isLinux) {
+      bind.mainStartDbusServer();
     }
     windowManager.setOpacity(1);
     windowManager.setTitle(getWindowName());

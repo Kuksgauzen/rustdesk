@@ -204,6 +204,17 @@ pub fn core_main() -> Option<CoreMainAction> {
         crate::platform::elevate_or_run_as_system(click_setup, _is_elevate, _is_run_as_system);
         return None;
     }
+    #[cfg(all(target_os = "linux", feature = "flutter"))]
+    if args.is_empty() {
+        if no_server {
+            // A main window restarting itself while the old one exits: the old one would still
+            // answer, so skip the probe and only hold other launches until this one is up.
+            let lock = crate::platform::linux::lock_main_window_start();
+            crate::platform::linux::hold_main_window_start(lock);
+        } else if !crate::platform::linux::start_main_window_or_show_running() {
+            return None;
+        }
+    }
     if args.is_empty() || crate::common::is_empty_uni_link(&args[0]) {
         #[cfg(target_os = "macos")]
         {
@@ -837,12 +848,14 @@ fn core_main_invoke_new_connection(mut args: std::env::Args) -> Option<Vec<Strin
 fn try_send_by_dbus(uni_links: String) -> Option<Vec<String>> {
     use crate::dbus::invoke_new_connection;
 
+    let lock = crate::platform::linux::lock_main_window_start();
     match invoke_new_connection(uni_links) {
         Ok(()) => {
             return None;
         }
         Err(err) => {
             log::error!("{}", err.as_ref());
+            crate::platform::linux::hold_main_window_start(lock);
             // return Some to invoke this url by self
             return Some(Vec::new());
         }

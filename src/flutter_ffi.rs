@@ -1882,7 +1882,9 @@ pub fn main_start_dbus_server() {
         use crate::dbus::start_dbus_server;
         // spawn new thread to start dbus server
         std::thread::spawn(|| {
-            let _ = start_dbus_server();
+            if let Err(err) = start_dbus_server() {
+                log::error!("Failed to serve dbus: {}", err);
+            }
         });
     }
 }

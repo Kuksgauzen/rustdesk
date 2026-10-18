@@ -2961,3 +2961,95 @@ pub fn has_gnome_shortcuts_inhibitor_permission() -> bool {
         }
     }
 }
+
+/// Show the running main window over DBus, the way the tray's Open item does, and return false.
+/// Return true when no main process answers and this one should start the main window.
+pub fn start_main_window_or_show_running() -> bool {
+    let lock = lock_main_window_start();
+    if crate::dbus::invoke_new_connection(crate::get_uri_prefix()).is_ok() {
+        return false;
+    }
+    hold_main_window_start(lock);
+    true
+}
+
+// Covers a main process start until its main window serves the DBus name: the Flutter engine,
+// Dart init and the first frame, a few seconds on a slow machine.
+const MAIN_WINDOW_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Wait while another process starts a main window, then lock out the launches after this one.
+///
+/// Launches that arrive while a main process starts find no owner of the DBus name and would each
+/// start another main process. A launch holds the returned lock until it has sent its url to the
+/// running main window or, through `hold_main_window_start`, until its own main window serves the
+/// name, so launches queued behind it reach that window. Without a usable `XDG_RUNTIME_DIR`, or
+/// after the timeout, the launch goes on without the lock and may start another main window.
+pub fn lock_main_window_start() -> Option<std::fs::File> {
+    use std::os::unix::{
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawFd,
+    };
+
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+    // `sudo` can keep the user's XDG_RUNTIME_DIR; a root-owned lock file there would lock the user out.
+    let euid = unsafe { hbb_common::libc::geteuid() };
+    if std::fs::metadata(&dir).map_or(true, |meta| meta.uid() != euid) {
+        return None;
+    }
+    let path = Path::new(&dir).join(format!("{}_main_start.lock", crate::get_app_name()));
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(hbb_common::libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) => {
+            log::warn!("Failed to open {}: {}", path.display(), err);
+            return None;
+        }
+    };
+    let deadline = Instant::now() + MAIN_WINDOW_START_TIMEOUT;
+    let flags = hbb_common::libc::LOCK_EX | hbb_common::libc::LOCK_NB;
+    while unsafe { hbb_common::libc::flock(file.as_raw_fd(), flags) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::WouldBlock
+            && err.kind() != std::io::ErrorKind::Interrupted
+        {
+            log::warn!("Failed to lock {}: {}", path.display(), err);
+            return None;
+        }
+        if Instant::now() >= deadline {
+            log::warn!("Another main window is still starting, going on without waiting");
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Some(file)
+}
+
+/// Keep the lock from `lock_main_window_start` until the main window of this process serves the
+/// DBus name, or fails to get it.
+pub fn hold_main_window_start(lock: Option<std::fs::File>) {
+    let Some(file) = lock else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + MAIN_WINDOW_START_TIMEOUT;
+        // Without a session bus the waiting launches cannot reach this window either, so holding
+        // the lock would only delay them.
+        let Ok(conn) = dbus::blocking::Connection::new_session() else {
+            return;
+        };
+        // The name must be ours: a main window restarting itself with `--no-server` queues for
+        // the name while the old process still owns it, and a url sent there would be lost. Dart
+        // serves the name only once it has shown or hidden its main window (`runMainApp` in
+        // flutter/lib/main.dart), so a queued show is not undone by a hide at startup.
+        while !crate::dbus::dbus_server_settled(&conn) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(file);
+    });
+}
