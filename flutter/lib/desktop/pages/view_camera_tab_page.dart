@@ -67,6 +67,9 @@ class _ViewCameraTabPageState extends State<ViewCameraTabPage> {
       ConnectionTypeState.init(peerId!);
       tabController.onSelected = (id) {
         final viewCameraPage = tabController.widget(id);
+        // A tab that was never shown has no page state yet. Its page calls
+        // this again after its first frame.
+        if (viewCameraPage is ViewCameraPage && !viewCameraPage.isBuilt) return;
         if (viewCameraPage is ViewCameraPage) {
           final ffi = viewCameraPage.ffi;
           bind.setCurSessionId(sessionId: ffi.sessionId);

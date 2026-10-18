@@ -66,6 +66,9 @@ class RemotePage extends StatefulWidget {
 
   FFI get ffi => (_lastState.value! as _RemotePageState)._ffi;
 
+  /// False until the tab is shown for the first time.
+  bool get isBuilt => _lastState.value != null;
+
   void releaseMacOSInputForTabTransfer() {
     if (!isMacOS) return;
     // Release before removing the source tab. Its delayed disposal must not

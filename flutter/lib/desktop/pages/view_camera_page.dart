@@ -62,6 +62,9 @@ class ViewCameraPage extends StatefulWidget {
 
   FFI get ffi => (_lastState.value! as _ViewCameraPageState)._ffi;
 
+  /// False until the tab is shown for the first time.
+  bool get isBuilt => _lastState.value != null;
+
   @override
   State<ViewCameraPage> createState() {
     final state = _ViewCameraPageState(id);

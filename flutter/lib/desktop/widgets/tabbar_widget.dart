@@ -26,6 +26,19 @@ const double _kIconSize = 18;
 const double _kDividerIndent = 10;
 const double _kActionIconSize = 12;
 
+/// Appends to [shown] the pages added after it and returns it, so that the
+/// pages already built keep their state. Returns null if [pages] does not
+/// start with [shown], i.e. a tab was removed or moved.
+@visibleForTesting
+List<Widget>? appendPages(List<Widget> shown, List<Widget> pages) {
+  if (shown.isEmpty || pages.length <= shown.length) return null;
+  for (var i = 0; i < shown.length; i++) {
+    if (!identical(shown[i], pages[i])) return null;
+  }
+  shown.addAll(pages.skip(shown.length));
+  return shown;
+}
+
 class TabInfo {
   final String key; // Notice: cm use client_id.toString() as key
   final String label;
@@ -571,12 +584,15 @@ class _DesktopTabState extends State<DesktopTab>
               final tabLen = state.value.tabs.length;
               if (tabLen == _tabWidgets.length) {
                 return _tabWidgets;
-              } else if (_tabWidgets.isNotEmpty &&
-                  tabLen == _tabWidgets.length + 1) {
-                /// On add. Use the previous list(pointer) to prevent item's state init twice.
-                /// *[_tabWidgets.isNotEmpty] means TabsWindow(remote_tab_page or file_manager_tab_page) opened before, but was hidden. In this case, we have to reload, otherwise the child can't be built.
-                _tabWidgets.add(state.value.tabs.last.page);
-                return _tabWidgets;
+              }
+
+              /// On add. Use the previous list(pointer) to prevent item's state init twice.
+              /// Several tabs can be added before the next build, e.g. by a burst of links.
+              /// *[_tabWidgets.isNotEmpty] means TabsWindow(remote_tab_page or file_manager_tab_page) opened before, but was hidden. In this case, we have to reload, otherwise the child can't be built.
+              final appended = appendPages(
+                  _tabWidgets, state.value.tabs.map((v) => v.page).toList());
+              if (appended != null) {
+                return appended;
               } else {
                 /// On remove or change. Use new list(pointer) to reload list children so that items loading order is normal.
                 /// the Widgets in list must enable [AutomaticKeepAliveClientMixin]
