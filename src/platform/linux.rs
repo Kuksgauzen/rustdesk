@@ -2961,3 +2961,244 @@ pub fn has_gnome_shortcuts_inhibitor_permission() -> bool {
         }
     }
 }
+
+/// Show the running main window over DBus, the way the tray's Open item does, and return false.
+/// Return true when no main process answers and this one should start the main window.
+pub fn start_main_window_or_show_running() -> bool {
+    lock_main_window_start();
+    crate::dbus::invoke_new_connection(crate::get_uri_prefix()).is_err()
+}
+
+/// Wait while another process starts a main window, then take that role.
+///
+/// Launches that arrive while a main process starts find no owner of the DBus name and would each
+/// start another main process. The lock is held until this process, or the one that answered,
+/// serves the name with a main window, so launches queued behind it reach that window. Without a
+/// usable `XDG_RUNTIME_DIR`, or after the timeout, the launch goes on without the lock.
+pub fn lock_main_window_start() {
+    use std::os::unix::{
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawFd,
+    };
+    // Covers a main process start until its main window serves the DBus name: the Flutter engine
+    // and Dart init, a few seconds on a slow machine.
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return;
+    };
+    // `sudo` can keep the user's XDG_RUNTIME_DIR; a root-owned lock file there would lock the user out.
+    let euid = unsafe { hbb_common::libc::geteuid() };
+    if std::fs::metadata(&dir).map_or(true, |meta| meta.uid() != euid) {
+        return;
+    }
+    let path = Path::new(&dir).join(format!("{}_main_start.lock", crate::get_app_name()));
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(hbb_common::libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) => {
+            log::warn!("Failed to open {}: {}", path.display(), err);
+            return;
+        }
+    };
+    let deadline = Instant::now() + TIMEOUT;
+    let flags = hbb_common::libc::LOCK_EX | hbb_common::libc::LOCK_NB;
+    while unsafe { hbb_common::libc::flock(file.as_raw_fd(), flags) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::WouldBlock
+            && err.kind() != std::io::ErrorKind::Interrupted
+        {
+            log::warn!("Failed to lock {}: {}", path.display(), err);
+            return;
+        }
+        if Instant::now() >= deadline {
+            log::warn!("Another main window is still starting, going on without waiting");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + TIMEOUT;
+        // Without a session bus the waiting launches cannot reach this window either, so holding
+        // the lock would only delay them.
+        let Ok(conn) = dbus::blocking::Connection::new_session() else {
+            return;
+        };
+        // The name must be ours: a main window restarting itself with `--no-server` queues for
+        // the name while the old process still owns it, and a url sent there would be lost. Dart
+        // serves the name only once it handles events (`runMainApp` in flutter/lib/main.dart).
+        while !crate::dbus::owns_dbus_name(&conn) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(file);
+    });
+}
+
+#[cfg(test)]
+mod main_window_launch_tests {
+    use super::*;
+
+    // A private session bus and runtime dir for a child test process, removed on drop. Only the
+    // child gets them: libdbus keeps the first session bus address it sees for the whole process,
+    // and changing the environment of this one would race with the tests running beside it.
+    struct SessionBus {
+        daemon: Child,
+        address: String,
+        runtime_dir: PathBuf,
+    }
+
+    impl SessionBus {
+        fn start() -> Option<Self> {
+            use std::io::{BufRead, BufReader};
+            use std::process::Stdio;
+
+            let runtime_dir =
+                std::env::temp_dir().join(format!("main_launch_{}", std::process::id()));
+            std::fs::create_dir_all(&runtime_dir).unwrap();
+            // The socket goes into the runtime dir, not wherever the distro's session.conf says.
+            let daemon = match Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address"])
+                .arg(format!("--address=unix:dir={}", runtime_dir.display()))
+                .stdout(Stdio::piped())
+                .spawn()
+            {
+                Ok(daemon) => daemon,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    let _ = std::fs::remove_dir_all(&runtime_dir);
+                    eprintln!("skipped: dbus-daemon is not installed");
+                    return None;
+                }
+                Err(err) => panic!("failed to start dbus-daemon: {}", err),
+            };
+            // From here on, any panic still kills the daemon in drop.
+            let mut bus = SessionBus {
+                daemon,
+                address: String::new(),
+                runtime_dir,
+            };
+            // Read on a thread, so a daemon that prints nothing fails the test instead of hanging it.
+            let stdout = bus.daemon.stdout.take().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut address = String::new();
+                let _ = BufReader::new(stdout).read_line(&mut address);
+                let _ = tx.send(address);
+            });
+            let address = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_default();
+            // An empty address would send the child to the user's own session bus.
+            assert!(
+                address.starts_with("unix:"),
+                "dbus-daemon printed no address within 10 s: {:?}",
+                address
+            );
+            bus.address = address.trim().to_owned();
+            Some(bus)
+        }
+    }
+
+    impl Drop for SessionBus {
+        fn drop(&mut self) {
+            let _ = self.daemon.kill();
+            let _ = self.daemon.wait();
+            let _ = std::fs::remove_dir_all(&self.runtime_dir);
+        }
+    }
+
+    const CHILD: &str = "RUSTDESK_TEST_MAIN_LAUNCH_CHILD";
+
+    #[test]
+    fn test_launch_burst_starts_one_main_window_and_shows_it_after() {
+        if std::env::var_os(CHILD).is_some() {
+            return launch_burst_scenario();
+        }
+        let Some(bus) = SessionBus::start() else {
+            return;
+        };
+        let name = format!(
+            "{}::test_launch_burst_starts_one_main_window_and_shows_it_after",
+            module_path!().split_once("::").unwrap().1
+        );
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+            .env("XDG_RUNTIME_DIR", &bus.runtime_dir)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Read on a thread, so a full pipe cannot stall the child.
+        let mut stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut output);
+            output
+        });
+        // The scenario takes well under a second; this only turns a hang into a failure.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let status = status.expect("the launch scenario hung");
+        let output = reader.join().unwrap();
+        print!("{}", output);
+        assert!(status.success(), "the launch scenario failed: {}", status);
+        // A test name that no longer matches would run nothing and still exit with 0.
+        assert!(
+            output.contains("test result: ok. 1 passed"),
+            "the launch scenario did not run"
+        );
+    }
+
+    fn launch_burst_scenario() {
+        let begin = Instant::now();
+
+        // Six clicks on the launcher icon at once, with no main window yet.
+        let launches: Vec<_> = (0..6)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let start = start_main_window_or_show_running();
+                    if start {
+                        // What the started main window does once Flutter is up.
+                        std::thread::spawn(|| crate::dbus::start_dbus_server().is_ok());
+                    }
+                    start
+                })
+            })
+            .collect();
+        let started = launches
+            .into_iter()
+            .map(|launch| launch.join().unwrap())
+            .filter(|&start| start)
+            .count();
+        assert_eq!(
+            started, 1,
+            "a burst of launches started {} main windows",
+            started
+        );
+        // Well under the 10 s lock timeout, so the queued launches were released by the DBus
+        // server coming up, not by giving up on the lock.
+        assert!(
+            begin.elapsed() < Duration::from_secs(5),
+            "the burst took {:?}",
+            begin.elapsed()
+        );
+        assert!(
+            !start_main_window_or_show_running(),
+            "a later launch started another main window"
+        );
+    }
+}
