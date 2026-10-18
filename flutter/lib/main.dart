@@ -139,6 +139,13 @@ void runMainApp(bool startService) async {
   if (startService) {
     gFFI.serverModel.startService();
   }
+  // Serve uri links from other launches only now: startService has set the event callback, and
+  // a url event that arrives before it is dropped. No need to await.
+  if (isLinux) {
+    bind.mainStartDbusServer();
+  } else if (isMacOS) {
+    bind.mainStartIpcUrlServer();
+  }
   await Future.wait([gFFI.abModel.loadCache(), gFFI.groupModel.loadCache()]);
   gFFI.userModel.refreshCurrentUser();
   runApp(App());

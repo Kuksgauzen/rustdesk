@@ -464,6 +464,7 @@ pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
                         .status()
                         .ok();
                     if show_new_window {
+                        crate::ipc::release_url_ipc_for_restart();
                         std::process::Command::new("open")
                             .arg("-n")
                             .arg(&format!("/Applications/{}.app", crate::get_app_name()))
@@ -2094,6 +2095,77 @@ pub(crate) fn get_bundle_id() -> Option<String> {
     }
 }
 
+// Every reopen event lands here, so a burst of them would otherwise all probe before any spawn
+// is up, each starting its own copy. Serialize probe-then-spawn, and keep the lock until the new
+// process answers on the url ipc socket so the queued events are forwarded to it.
+pub fn handle_url_scheme(url: String) {
+    static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(err) = crate::ipc::send_url_scheme(url.clone()) {
+        log::debug!("Send the url to the existing flutter process failed, {}. Let's open a new program to handle this.", err);
+        match crate::run_me(vec![url]) {
+            // Reaped like the other server-side `run_me` calls, or it stays a zombie under `--server`.
+            Ok(child) => {
+                crate::server::CHILD_PROCESS.lock().unwrap().push(child);
+                if !wait_url_scheme_server(std::time::Duration::from_secs(3)) {
+                    log::warn!("The new main process did not take the url ipc socket in time");
+                }
+            }
+            Err(err) => log::error!("Failed to start a new main process: {}", err),
+        }
+    }
+}
+
+// Poll until a freshly spawned main process serves the url ipc socket. This runs on the reopen
+// handler's own thread, so it blocks there instead of starting a runtime.
+fn wait_url_scheme_server(timeout: std::time::Duration) -> bool {
+    let path = hbb_common::config::Config::ipc_path("_url");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+// `new_listener` unlinks the socket when its owner is gone, so `AddrInUse` means another main
+// process owns the url ipc server and this one is a redundant copy that would otherwise stay
+// alive as a second tray icon nothing cleans up.
+pub async fn exit_if_url_server_is_taken(err: &hbb_common::anyhow::Error) {
+    use crate::ipc::Data;
+    let addr_in_use = err
+        .downcast_ref::<std::io::Error>()
+        .map(|e| e.kind() == std::io::ErrorKind::AddrInUse)
+        .unwrap_or(false);
+    if !addr_in_use {
+        return;
+    }
+    // An empty url is meaningful too: the owner raises its main window on it. Anything else,
+    // such as `--connect`, is not a url the owner can handle, so this copy keeps running.
+    let url = std::env::args().nth(1).unwrap_or_default();
+    if !url.is_empty() && !url.starts_with(&crate::common::get_uri_prefix()) {
+        return;
+    }
+    let forwarded = match crate::ipc::connect(1_000, "_url").await {
+        Ok(mut conn) => conn.send(&Data::UrlLink(url)).await,
+        Err(err) => Err(err),
+    };
+    // Exit only once the url went out to the owner, or nothing would be left to handle it. A send
+    // that went through is all we know: an owner that is itself closing right now drops it.
+    if let Err(err) = forwarded {
+        log::warn!("Failed to forward the url, keeping this copy: {}", err);
+        return;
+    }
+    log::info!("Url ipc server is owned by another main process, exiting this copy");
+    // `_exit` skips destructors and atexit handlers. `process::exit` would run teardown under live
+    // Flutter threads, which can abort. This copy owns nothing yet.
+    unsafe { hbb_common::libc::_exit(0) }
+}
+
 #[cfg(test)]
 mod update_tests {
     use super::*;
@@ -2170,5 +2242,83 @@ mod update_tests {
         }
 
         std::fs::remove_dir_all(test_dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod url_scheme_tests {
+    use crate::{
+        common::handle_url_scheme,
+        ipc::{self, Data},
+    };
+    use hbb_common::{futures::StreamExt, tokio};
+    use std::{thread, time::Duration};
+
+    // A burst of reopen events before any main process owns the url socket used to start one copy
+    // per event and lose the urls. The test plays the started copy: `run_me` starts this test
+    // binary, which takes the url as a test filter and exits, and the test takes the url socket.
+    #[test]
+    fn burst_of_reopen_events_reaches_one_main_process() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        if rt.block_on(ipc::connect(300, "_url")).is_ok() {
+            eprintln!("skipped: a running RustDesk owns the url socket");
+            return;
+        }
+        const BURST: usize = 4;
+        // Reap the started copies and leave no url socket behind, also when an assert fails.
+        // Only this test reopens, so the children pushed after `started` are its own.
+        struct Cleanup(usize);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let copies = crate::server::CHILD_PROCESS
+                    .lock()
+                    .map(|mut children| children.split_off(self.0))
+                    .unwrap_or_default();
+                for mut copy in copies {
+                    let _ = copy.kill();
+                    let _ = copy.wait();
+                }
+                let path = hbb_common::config::Config::ipc_path("_url");
+                for file in [
+                    path.clone(),
+                    format!("{}.pid", path),
+                    format!("{}.lock", path),
+                ] {
+                    let _ = std::fs::remove_file(file);
+                }
+            }
+        }
+        let started = crate::server::CHILD_PROCESS.lock().unwrap().len();
+        let _cleanup = Cleanup(started);
+        let events: Vec<_> = (0..BURST)
+            .map(|_| thread::spawn(|| handle_url_scheme("rustdesk://burst-test".into())))
+            .collect();
+        // Take the socket only once a copy was started, as that copy would.
+        for _ in 0..300 {
+            if crate::server::CHILD_PROCESS.lock().unwrap().len() > started {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let urls = rt.block_on(async {
+            let mut incoming = ipc::new_listener("_url").await.unwrap();
+            let mut urls = 0;
+            while let Ok(Some(Ok(conn))) =
+                tokio::time::timeout(Duration::from_secs(2), incoming.next()).await
+            {
+                let mut conn = ipc::Connection::new(conn);
+                if let Ok(Some(Data::UrlLink(_))) = conn.next_timeout(1000).await {
+                    urls += 1;
+                }
+            }
+            urls
+        });
+        for event in events {
+            event.join().unwrap();
+        }
+        assert_eq!(urls, BURST - 1, "the main process missed urls");
     }
 }
