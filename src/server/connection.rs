@@ -6738,7 +6738,7 @@ impl Drop for Connection {
     }
 }
 
-extern "C" fn connection_shutdown_hook() {
+pub(crate) extern "C" fn connection_shutdown_hook() {
     // https://stackoverflow.com/questions/35980148/why-does-an-atexit-handler-panic-when-it-accesses-stdout
     // Please make sure there is no print in the call stack
     #[cfg(any(target_os = "windows", target_os = "linux"))]

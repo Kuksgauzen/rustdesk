@@ -882,6 +882,13 @@ async fn handle(data: Data, stream: &mut Connection) {
                     hbb_common::sleep(0.3).await;
                     // in case below exit failed
                     crate::platform::quit_gui();
+                    // `process::exit` from this thread runs C++ static destructors and unloads
+                    // libraries while the GUI main thread is still running Flutter tasks, which
+                    // then abort on a destroyed object.
+                    // `_exit` also skips atexit handlers: run the one that restores the wallpaper
+                    // if this process runs the server itself.
+                    crate::server::connection_shutdown_hook();
+                    unsafe { hbb_common::libc::_exit(-1) }
                 }
                 std::process::exit(-1); // to make sure --server luauchagent process can restart because SuccessfulExit used
             }
