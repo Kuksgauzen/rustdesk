@@ -572,10 +572,15 @@ class _DesktopTabState extends State<DesktopTab>
               if (tabLen == _tabWidgets.length) {
                 return _tabWidgets;
               } else if (_tabWidgets.isNotEmpty &&
-                  tabLen == _tabWidgets.length + 1) {
+                  tabLen > _tabWidgets.length &&
+                  _tabWidgets.indexed.every(
+                      (e) => identical(e.$2, state.value.tabs[e.$1].page))) {
                 /// On add. Use the previous list(pointer) to prevent item's state init twice.
+                /// Several tabs can be added before the next build, e.g. by a burst of links.
                 /// *[_tabWidgets.isNotEmpty] means TabsWindow(remote_tab_page or file_manager_tab_page) opened before, but was hidden. In this case, we have to reload, otherwise the child can't be built.
-                _tabWidgets.add(state.value.tabs.last.page);
+                _tabWidgets.addAll(state.value.tabs
+                    .skip(_tabWidgets.length)
+                    .map((v) => v.page));
                 return _tabWidgets;
               } else {
                 /// On remove or change. Use new list(pointer) to reload list children so that items loading order is normal.
