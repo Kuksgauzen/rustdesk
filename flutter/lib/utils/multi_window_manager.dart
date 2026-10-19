@@ -57,26 +57,21 @@ class RustDeskMultiWindowManager {
 
   static final instance = RustDeskMultiWindowManager._();
 
-  @visibleForTesting
-  static Future<dynamic> Function(int, String, dynamic) invoke =
-      DesktopMultiWindow.invokeMethod;
-  @visibleForTesting
-  static Duration invokeRetryDelay = const Duration(milliseconds: 100);
   static const int _kInvokeRetries = 30;
+  static const _kInvokeRetryDelay = Duration(milliseconds: 100);
 
   /// A window just created by `newSessionWindow` registers its method handler
   /// only after its Dart side is up (`_ConnectionTabPageState`), until then
   /// `invokeMethod` throws `MissingPluginException`. Wait for it (about 3s)
   /// instead of dropping the call, e.g. a burst of uri links at startup.
-  @visibleForTesting
   static Future<dynamic> invokeWindow(
       int windowId, String method, dynamic args) async {
     for (var i = 0;; i++) {
       try {
-        return await invoke(windowId, method, args);
+        return await DesktopMultiWindow.invokeMethod(windowId, method, args);
       } on MissingPluginException {
         if (i >= _kInvokeRetries) rethrow;
-        await Future.delayed(invokeRetryDelay);
+        await Future.delayed(_kInvokeRetryDelay);
       }
     }
   }
