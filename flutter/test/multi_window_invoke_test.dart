@@ -33,4 +33,20 @@ void main() {
         throwsA(isA<PlatformException>()));
     expect(calls, 1);
   });
+
+  test('newSession probe survives a window added while it waits', () async {
+    final windows = [1, 2];
+    // FileTransfer: openInTabs needs no FFI, and call() sees the manager's own empty list, so nothing else is invoked.
+    final probed = <int>[];
+    RustDeskMultiWindowManager.invoke = (windowId, method, args) async {
+      probed.add(windowId);
+      // A concurrent newSessionWindow registers a new window meanwhile; it has no handler yet, so it must not be probed.
+      if (probed.length == 1) windows.add(3);
+      return false;
+    };
+
+    await RustDeskMultiWindowManager.instance
+        .newSession(WindowType.FileTransfer, 'm', 'id', windows);
+    expect(probed, [1, 2]);
+  });
 }

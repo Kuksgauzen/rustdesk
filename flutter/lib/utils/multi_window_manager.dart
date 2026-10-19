@@ -126,7 +126,7 @@ class RustDeskMultiWindowManager {
     final isCamera = windowType == WindowType.ViewCamera.index;
     final windowIDs = isCamera ? _viewCameraWindows : _remoteDesktopWindows;
     if (windowIDs.length > 1) {
-      for (final windowId in windowIDs) {
+      for (final windowId in List.of(windowIDs)) {
         if (await invokeWindow(
             windowId,
             kWindowEventActiveDisplaySession,
@@ -280,7 +280,7 @@ class RustDeskMultiWindowManager {
         mainGetLocalBoolOptionSync(kOptionOpenNewConnInTabs);
 
     if (windows.length > 1 || !openInTabs) {
-      for (final windowId in windows) {
+      for (final windowId in List.of(windows)) {
         bool active = false;
         try {
           active =
