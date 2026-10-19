@@ -111,7 +111,7 @@ fn handle_client_message(builder: &mut IfaceBuilder<()>) {
             if !_uni_links.starts_with(&crate::get_uri_prefix())
                 && _uni_links
                     .split_once("://")
-                    .map_or(false, |(_, path)| path.chars().all(|c| c == '/'))
+                    .is_some_and(|(_, path)| path.chars().all(|c| c == '/'))
             {
                 return Ok(("not ours".to_string(),));
             }
