@@ -57,6 +57,30 @@ class RustDeskMultiWindowManager {
 
   static final instance = RustDeskMultiWindowManager._();
 
+  @visibleForTesting
+  static Future<dynamic> Function(int, String, dynamic) invoke =
+      DesktopMultiWindow.invokeMethod;
+  @visibleForTesting
+  static Duration invokeRetryDelay = const Duration(milliseconds: 100);
+  static const int _kInvokeRetries = 30;
+
+  /// A window just created by `newSessionWindow` registers its method handler
+  /// only after its Dart side is up (`_ConnectionTabPageState`), until then
+  /// `invokeMethod` throws `MissingPluginException`. Wait for it (about 3s)
+  /// instead of dropping the call, e.g. a burst of uri links at startup.
+  @visibleForTesting
+  static Future<dynamic> invokeWindow(
+      int windowId, String method, dynamic args) async {
+    for (var i = 0;; i++) {
+      try {
+        return await invoke(windowId, method, args);
+      } on MissingPluginException {
+        if (i >= _kInvokeRetries) rethrow;
+        await Future.delayed(invokeRetryDelay);
+      }
+    }
+  }
+
   final Set<int> _inactiveWindows = {};
   final Set<int> _activeWindows = {};
   final List<AsyncCallback> _windowActiveCallbacks = List.empty(growable: true);
@@ -103,7 +127,7 @@ class RustDeskMultiWindowManager {
     final windowIDs = isCamera ? _viewCameraWindows : _remoteDesktopWindows;
     if (windowIDs.length > 1) {
       for (final windowId in windowIDs) {
-        if (await DesktopMultiWindow.invokeMethod(
+        if (await invokeWindow(
             windowId,
             kWindowEventActiveDisplaySession,
             jsonEncode({
@@ -204,7 +228,7 @@ class RustDeskMultiWindowManager {
               await restoreWindowPosition(type,
                   windowId: windowId, peerId: remoteId);
             }
-            await DesktopMultiWindow.invokeMethod(windowId, methodName, msg);
+            await invokeWindow(windowId, methodName, msg);
             if (methodName != kWindowEventNewRemoteDesktop) {
               WindowController.fromWindowId(windowId).show();
             }
@@ -257,8 +281,14 @@ class RustDeskMultiWindowManager {
 
     if (windows.length > 1 || !openInTabs) {
       for (final windowId in windows) {
-        if (await DesktopMultiWindow.invokeMethod(
-            windowId, kWindowEventActiveSession, remoteId)) {
+        bool active = false;
+        try {
+          active =
+              await invokeWindow(windowId, kWindowEventActiveSession, remoteId);
+        } on MissingPluginException {
+          // It never answered, so it cannot have this session.
+        }
+        if (active) {
           return MultiWindowCallResult(windowId, null);
         }
       }
@@ -391,13 +421,11 @@ class RustDeskMultiWindowManager {
     }
     for (final windowId in wnds) {
       if (_activeWindows.contains(windowId)) {
-        final res =
-            await DesktopMultiWindow.invokeMethod(windowId, methodName, args);
+        final res = await invokeWindow(windowId, methodName, args);
         return MultiWindowCallResult(windowId, res);
       }
     }
-    final res =
-        await DesktopMultiWindow.invokeMethod(wnds[0], methodName, args);
+    final res = await invokeWindow(wnds[0], methodName, args);
     return MultiWindowCallResult(wnds[0], res);
   }
 
